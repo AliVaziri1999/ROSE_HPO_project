@@ -1,41 +1,59 @@
 """
-02-runtime-bayesian.py
+Distributed BAYESIAN OPTIMIZATION over MNIST hyperparameters using the ROSE runtime.
 
-Bayesian Optimization over MNIST hyperparameters.
+This script is the runtime-level counterpart of `02-local-bayesian.py`:
+- Local   examples: run HPO on a single process (no asyncflow / ROSE).
+- Runtime examples: submit each config as a ROSE task, executed
+  via `radical.asyncflow` with a `ProcessPoolExecutor`.
 
-This script:
-  - builds a MNIST MLP (no dropout, 1–2 hidden layers)
-  - defines an objective = validation accuracy
-  - creates an HPOLearner + HPOLearnerConfig
-  - runs Bayesian Optimization via run_bayesian_hpo_task()
+Here we:
+  * Load MNIST.
+  * Define a simple MLP (no dropout, up to 2 dense layers).
+  * Wrap training + evaluation in an objective(params) function.
+  * Use HPOLearner + HPOLearnerConfig to manage the search space.
+  * Call run_bayesian_search_distributed to pick promising configs
+    using a Gaussian Process surrogate and an acquisition function.
 
-If --distributed is given, the BO evaluations are executed using the
-ROSE / AsyncFlow runtime (see rose.hpo.runtime_bayesian).
-Otherwise, the optimization is performed locally.
+Command-line interface mirrors 00-runtime-grid.py and 01-runtime-random.py.
 """
 
 import argparse
-from typing import Dict, Any
+import asyncio
+from concurrent.futures import ProcessPoolExecutor
+from typing import Dict, Any, List
 
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers, models
 
-from rose.hpo import HPOLearner, HPOLearnerConfig, run_bayesian_hpo_task
+from radical.asyncflow import WorkflowEngine, ConcurrentExecutionBackend
+from radical.asyncflow.logging import init_default_logger
+
+from rose.hpo import HPOLearner, HPOLearnerConfig
+from rose.hpo.runtime import run_bayesian_search_distributed
 
 
 # ---------------------------------------------------------------------------
-# 1) MNIST DATA
+# 1) Data utilities: load & preprocess MNIST
 # ---------------------------------------------------------------------------
 
 def load_mnist(normalize: bool = True):
     """
-    Load and flatten MNIST, then split:
-      - 50k for training
-      - 10k for validation
+    Load the MNIST dataset and return (x_train, y_train), (x_val, y_val).
+
+    We split the original training set into:
+      - 50k samples for training
+      - 10k samples for validation
+
+    Shapes:
+      x_train: (50000, 784)  float32
+      y_train: (50000,)      int64
+      x_val  : (10000, 784)  float32
+      y_val  : (10000,)      int64
     """
     (x_train_full, y_train_full), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
 
+    # Flatten 28x28 images → 784-dim vectors
     x_train_full = x_train_full.reshape(-1, 784).astype("float32")
     x_test = x_test.reshape(-1, 784).astype("float32")
 
@@ -43,6 +61,7 @@ def load_mnist(normalize: bool = True):
         x_train_full /= 255.0
         x_test /= 255.0
 
+    # Take 50k for training, 10k for validation
     x_train = x_train_full[:50000]
     y_train = y_train_full[:50000]
     x_val = x_train_full[50000:]
@@ -52,7 +71,7 @@ def load_mnist(normalize: bool = True):
 
 
 # ---------------------------------------------------------------------------
-# 2) MODEL: 1–2 hidden layers, NO DROPOUT
+# 2) Model builder: simple 1–2 layer MLP (no dropout)
 # ---------------------------------------------------------------------------
 
 def build_mlp(input_dim: int,
@@ -61,11 +80,13 @@ def build_mlp(input_dim: int,
               learning_rate: float,
               l2_reg: float) -> tf.keras.Model:
     """
-    Simple fully-connected classifier for MNIST, satisfying project rules:
+    Build a simple fully-connected network for MNIST classification.
+
+    Constraints (aligned with project requirements):
       - No dropout.
       - 1 or 2 hidden layers.
       - ReLU activations.
-      - Final 10-way softmax.
+      - Softmax output for 10 classes.
     """
     assert num_layers in (1, 2), "num_layers must be 1 or 2"
 
@@ -83,7 +104,7 @@ def build_mlp(input_dim: int,
         )
     )
 
-    # Optional second hidden layer
+    # second hidden layer
     if num_layers == 2:
         model.add(
             layers.Dense(
@@ -93,35 +114,45 @@ def build_mlp(input_dim: int,
             )
         )
 
-    # Output layer
+    # Output layer: 10-way softmax
     model.add(layers.Dense(10, activation="softmax"))
 
     opt = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+
     model.compile(
         optimizer=opt,
         loss="sparse_categorical_crossentropy",
         metrics=["accuracy"],
     )
+
     return model
 
 
 # ---------------------------------------------------------------------------
-# 3) OBJECTIVE(params) → validation accuracy (maximize)
+# 3) Objective wrapper for HPOLearner: params -> val_accuracy (to maximize)
 # ---------------------------------------------------------------------------
 
-def make_objective(x_train,
-                   y_train,
-                   x_val,
-                   y_val,
+def make_objective(x_train: np.ndarray,
+                   y_train: np.ndarray,
+                   x_val: np.ndarray,
+                   y_val: np.ndarray,
                    epochs: int):
+    """
+    Create an objective(params) -> score function.
+
+    The score is validation accuracy after training on MNIST with the
+    hyperparameters in params. Higher is better (maximize=True).
+    """
 
     def objective(params: Dict[str, Any]) -> float:
+        # Extract hyperparameters (already Python scalars in this setup)
         learning_rate = float(params["learning_rate"])
         num_layers = int(params["num_layers"])
         hidden_units = int(params["hidden_units"])
         batch_size = int(params["batch_size"])
         l2_reg = float(params["l2_reg"])
 
+        # Build and train the model
         model = build_mlp(
             input_dim=x_train.shape[1],
             num_layers=num_layers,
@@ -139,19 +170,27 @@ def make_objective(x_train,
             verbose=0,
         )
 
+        # Last epoch's validation accuracy
         val_acc = float(history.history["val_accuracy"][-1])
-        print(f"[RUNTIME-BO] Params {params} → Val Accuracy = {val_acc:.4f}")
-        return val_acc  # maximize
+
+        print(
+            f"[RUNTIME-BAYESIAN] Params {params} → "
+            f"Val Accuracy = {val_acc:.4f}"
+        )
+
+        return val_acc  # we want to maximize this
 
     return objective
 
 
 # ---------------------------------------------------------------------------
-# 4) CLI
+# 4) CLI parser: search space + BO hyperparameters
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
     """
+    Command-line interface for configuring the Bayesian search.
+
     Example:
 
       python -m examples.hpo.runtime.02-runtime-bayesian \
@@ -161,102 +200,178 @@ def parse_args() -> argparse.Namespace:
         --batch_size 32 64 \
         --l2_reg 0.0 0.0001 \
         --epochs 3 \
-        --n_init 4 \
-        --n_iter 8 \
+        --n_init 5 \
+        --n_iter 10 \
         --kappa 2.0 \
         --rng_seed 0 \
-        --distributed
+        --checkpoint_path checkpoints/bayesian_history.json \
+        --checkpoint_freq 2
     """
     parser = argparse.ArgumentParser(
-        description="Bayesian optimization over MNIST hyperparameters."
+        description="Distributed Bayesian optimization over MNIST hyperparameters using ROSE runtime.",
     )
 
-    parser.add_argument("--learning_rate", type=float, nargs="+",
-                        default=[0.0005, 0.001, 0.002])
-    parser.add_argument("--num_layers", type=int, nargs="+",
-                        default=[1, 2])
-    parser.add_argument("--hidden_units", type=int, nargs="+",
-                        default=[64, 128])
-    parser.add_argument("--batch_size", type=int, nargs="+",
-                        default=[32, 64])
-    parser.add_argument("--l2_reg", type=float, nargs="+",
-                        default=[0.0, 0.0001])
-
-    parser.add_argument("--epochs", type=int, default=3,
-                        help="Training epochs per evaluation.")
-
-    parser.add_argument("--n_init", type=int, default=4,
-                        help="Initial random evaluations before BO.")
-    parser.add_argument("--n_iter", type=int, default=8,
-                        help="Number of BO iterations.")
-    parser.add_argument("--kappa", type=float, default=2.0,
-                        help="UCB exploration parameter.")
-    parser.add_argument("--rng_seed", type=int, default=0,
-                        help="Random seed for BO / HPOLearner.")
-
+    # Search space (discrete grid, same style as grid/random)
     parser.add_argument(
-        "--distributed",
-        action="store_true",
-        help="If set, run Bayesian optimization using ROSE / AsyncFlow.",
+        "--learning_rate",
+        type=float,
+        nargs="+",
+        default=[0.0005, 0.001],
+        help="Candidate learning rates.",
+    )
+    parser.add_argument(
+        "--num_layers",
+        type=int,
+        nargs="+",
+        default=[1, 2],
+        help="Number of hidden layers (1 or 2).",
+    )
+    parser.add_argument(
+        "--hidden_units",
+        type=int,
+        nargs="+",
+        default=[64, 128],
+        help="Number of units per hidden layer.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        nargs="+",
+        default=[32, 64],
+        help="Candidate batch sizes.",
+    )
+    parser.add_argument(
+        "--l2_reg",
+        type=float,
+        nargs="+",
+        default=[0.0, 0.0001],
+        help="Candidate L2 regularization strengths.",
+    )
+
+    # Training setting
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=3,
+        help="Number of training epochs per configuration.",
+    )
+
+    # Bayesian optimization hyperparameters
+    parser.add_argument(
+        "--n_init",
+        type=int,
+        default=5,
+        help="Number of initial random points to evaluate.",
+    )
+    parser.add_argument(
+        "--n_iter",
+        type=int,
+        default=10,
+        help="Number of BO iterations after the initial phase.",
+    )
+    parser.add_argument(
+        "--kappa",
+        type=float,
+        default=2.0,
+        help="Exploration parameter for the UCB acquisition function.",
+    )
+    parser.add_argument(
+        "--rng_seed",
+        type=int,
+        default=0,
+        help="Random seed for BO (sampling / shuffling).",
+    )
+
+    # Checkpointing options (same style as grid/random)
+    parser.add_argument(
+        "--checkpoint_path",
+        type=str,
+        default=None,
+        help="If set, periodically write JSON history to this path.",
+    )
+    parser.add_argument(
+        "--checkpoint_freq",
+        type=int,
+        default=10,
+        help="Save a checkpoint every N successful evaluations.",
     )
 
     return parser.parse_args()
 
 
 # ---------------------------------------------------------------------------
-# 5) MAIN – local or distributed BO
+# 5) Main: set up ROSE runtime and run distributed Bayesian search
 # ---------------------------------------------------------------------------
 
-def main():
+async def main():
+    # 5.1 Parse CLI flags
     args = parse_args()
 
-    # 5.1 Load data
-    (x_train, y_train), (x_val, y_val) = load_mnist()
+    # 5.2 Initialize logging + execution backend + workflow engine
+    init_default_logger()
 
-    # 5.2 Objective
-    objective = make_objective(
-        x_train=x_train,
-        y_train=y_train,
-        x_val=x_val,
-        y_val=y_val,
-        epochs=args.epochs,
-    )
+    backend = await ConcurrentExecutionBackend(ProcessPoolExecutor())
+    asyncflow = await WorkflowEngine.create(backend)
 
-    # 5.3 Search space
-    param_grid = {
-        "learning_rate": args.learning_rate,
-        "num_layers": args.num_layers,
-        "hidden_units": args.hidden_units,
-        "batch_size": args.batch_size,
-        "l2_reg": args.l2_reg,
-    }
+    try:
+        # 5.3 Load MNIST data
+        (x_train, y_train), (x_val, y_val) = load_mnist()
 
-    config = HPOLearnerConfig(
-        param_grid=param_grid,
-        maximize=True,  # maximize validation accuracy
-    )
+        # 5.4 Build objective function
+        objective = make_objective(
+            x_train=x_train,
+            y_train=y_train,
+            x_val=x_val,
+            y_val=y_val,
+            epochs=args.epochs,
+        )
 
-    hpo = HPOLearner(
-        objective_fn=objective,
-        config=config,
-    )
+        # 5.5 Define discrete search space from CLI ranges
+        param_grid: Dict[str, List[Any]] = {
+            "learning_rate": args.learning_rate,
+            "num_layers": args.num_layers,
+            "hidden_units": args.hidden_units,
+            "batch_size": args.batch_size,
+            "l2_reg": args.l2_reg,
+            # epochs is fixed per run and captured via closure
+        }
 
-    # 5.4 Run Bayesian optimization (local or distributed)
-    result = run_bayesian_hpo_task(
-        hpo=hpo,
-        n_init=args.n_init,
-        n_iter=args.n_iter,
-        kappa=args.kappa,
-        rng_seed=args.rng_seed,
-        distributed=args.distributed,
-    )
+        config = HPOLearnerConfig(
+            param_grid=param_grid,
+            maximize=True,  # we maximize validation accuracy
+        )
 
-    print("\n===== BAYESIAN OPTIMIZATION RESULT =====")
-    print(f"Total evaluations: {len(result['history'])}")
-    print(f"Best params: {result['best_params']}")
-    print(f"Best Val Accuracy: {result['best_score']:.4f}")
-    print("========================================\n")
+        # Wrap objective in HPOLearner (shared abstraction with other examples)
+        hpo = HPOLearner(objective_fn=objective, config=config)
+
+        # 5.6 Run BAYESIAN SEARCH in a distributed fashion via ROSE runtime
+        result = await run_bayesian_search_distributed(
+            asyncflow=asyncflow,
+            hpo=hpo,
+            n_init=args.n_init,
+            n_iter=args.n_iter,
+            kappa=args.kappa,
+            rng_seed=args.rng_seed,
+            checkpoint_path=args.checkpoint_path,
+            checkpoint_freq=args.checkpoint_freq,
+        )
+
+        best_params = result["best_params"]
+        best_score = result["best_score"]
+        history = result["history"]
+
+        print("\n=== HPO via ROSE runtime (BAYESIAN, distributed, MNIST) ===")
+        print(f"Total evaluated configurations: {len(history)}")
+        print(f"Best params: {best_params}")
+        print(f"Best score (Val Accuracy): {best_score:.4f}")
+
+        print("\n=== Result object returned to main() ===")
+        print(result)
+
+    finally:
+        # 5.7 Clean shutdown of the workflow engine + backend
+        await asyncflow.shutdown()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

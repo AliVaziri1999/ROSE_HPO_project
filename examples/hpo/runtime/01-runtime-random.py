@@ -1,6 +1,4 @@
 """
-01-runtime-random.py
-
 Distributed RANDOM SEARCH over MNIST hyperparameters using the ROSE runtime.
 
 This script is the runtime-level counterpart of `01-local-random.py`:
@@ -106,7 +104,7 @@ def build_mlp(input_dim: int,
         )
     )
 
-    # Optional second hidden layer
+    # second hidden layer
     if num_layers == 2:
         model.add(
             layers.Dense(
@@ -263,6 +261,20 @@ def parse_args() -> argparse.Namespace:
         help="Random seed for drawing configurations.",
     )
 
+    # checkpoint arguments, matching 00-runtime-grid style
+    parser.add_argument(
+        "--checkpoint_path",
+        type=str,
+        default=None,
+        help="Path to save JSON checkpoint of HPO history.",
+    )
+    parser.add_argument(
+        "--checkpoint_freq",
+        type=int,
+        default=10,
+        help="Save a checkpoint every N successful evaluations (default: 10).",
+    )
+
     return parser.parse_args()
 
 
@@ -317,6 +329,8 @@ async def main():
             hpo=hpo,
             n_samples=args.n_samples,
             rng_seed=args.rng_seed,
+            checkpoint_path=args.checkpoint_path,
+            checkpoint_freq=args.checkpoint_freq,
         )
 
         best_params = result["best_params"]

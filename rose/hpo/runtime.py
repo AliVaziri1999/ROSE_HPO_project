@@ -9,11 +9,27 @@ from radical.asyncflow import WorkflowEngine
 from .hpo_learner import HPOLearner
 
 
+# Small helper for JSON serialization of NumPy types
+def _json_default(obj):
+    """
+    Convert NumPy types to plain Python types so json.dumps can handle them.
+    """
+    import numpy as _np
+
+    if isinstance(obj, (_np.integer,)):
+        return int(obj)
+    if isinstance(obj, (_np.floating,)):
+        return float(obj)
+    if isinstance(obj, _np.ndarray):
+        return obj.tolist()
+    return obj
+
+
 # ===========================================================================
 # INTERNAL HELPER — distributed evaluation of multiple configs
 # Added:
 #   - return_exceptions=True for fault tolerance
-#   - optional checkpointing argument
+#   - checkpointing argument (path + frequency)
 # ===========================================================================
 async def _evaluate_configs_distributed(
     asyncflow: WorkflowEngine,
@@ -21,14 +37,24 @@ async def _evaluate_configs_distributed(
     param_list: List[Dict[str, Any]],
     context_label: str = "HPO",
     checkpoint_path: str | None = None,
+    checkpoint_freq: int = 10,
 ) -> Dict[str, Any]:
     """
     Evaluate each params dict as a separate ROSE task using asyncflow.
 
     Improvements included:
       - fault-tolerant gather() (per-task exception handling)
-      - optional checkpointing
+      - checkpointing
       - shared by Grid, Random, Bayesian, GA distributed versions.
+
+    Parameters
+    ----------
+    checkpoint_path : str or None
+        If not None, write the full hpo.history as JSON to this path
+        periodically during the run.
+    checkpoint_freq : int
+        Save a checkpoint every `checkpoint_freq` successful evaluations.
+        If <= 0, checkpointing is disabled.
     """
 
     if not param_list:
@@ -40,21 +66,21 @@ async def _evaluate_configs_distributed(
 
     local_history: List[Dict[str, Any]] = []
 
-    # Worker function
+    # Worker function (runs inside ROSE workers)
     async def eval_one(params: Dict[str, Any]) -> Dict[str, Any]:
         try:
             score = hpo.objective_fn(params)
             return {"params": params, "score": float(score)}
         except Exception as e:
+            # We capture the error instead of crashing the whole run
             return {"params": params, "error": str(e), "score": None}
 
     eval_task = asyncflow.function_task(eval_one)
     futures = [eval_task(p) for p in param_list]
 
-    # Fault-tolerant gather
+    # Fault-tolerant gather: we also handle AsyncFlow-level exceptions
     results = await asyncio.gather(*futures, return_exceptions=True)
 
-    # Evaluate results
     best_params = None
     best_score: float | None = None
 
@@ -89,13 +115,35 @@ async def _evaluate_configs_distributed(
                 best_score = score
                 best_params = rec["params"]
 
-        # Optional checkpointing
-        if checkpoint_path is not None and len(hpo.history) % 10 == 0:
-            import json, pathlib
-            pathlib.Path(checkpoint_path).write_text(
-                json.dumps(hpo.history, indent=2)
+        # checkpointing every N successful evaluations
+        if (
+            checkpoint_path is not None
+            and checkpoint_freq > 0
+            and len(local_history) > 0
+            and len(local_history) % checkpoint_freq == 0
+        ):
+            import json
+            import pathlib
+            import os
+
+            # Project root: ROSE_HPO_project/
+            project_root = pathlib.Path(__file__).resolve().parents[2]
+            default_dir = project_root / "checkpoints"
+
+            raw_path = pathlib.Path(checkpoint_path)
+
+            # If user passed a relative name, always place under ./checkpoints/
+            if not raw_path.is_absolute():
+                path = default_dir / raw_path
+            else:
+                path = raw_path
+
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+            path.write_text(
+                json.dumps(hpo.history, default=_json_default, indent=2)
             )
-            print(f"[{context_label}] Checkpoint saved → {checkpoint_path}")
+            print(f"[{context_label}] Checkpoint saved → {path}")
 
     if best_params is None or best_score is None:
         raise ValueError(f"[{context_label}] No valid results – all configs failed.")
@@ -118,25 +166,37 @@ async def _evaluate_configs_distributed(
 async def run_grid_search_distributed(
     asyncflow: WorkflowEngine,
     hpo: HPOLearner,
+    checkpoint_path: str | None = None,
+    checkpoint_freq: int = 10,
 ) -> Dict[str, Any]:
+    """
+    Distributed GRID search: one config → one ROSE task.
+    """
     param_list = list(hpo._iter_param_combinations())
     return await _evaluate_configs_distributed(
         asyncflow=asyncflow,
         hpo=hpo,
         param_list=param_list,
         context_label="GRID",
+        checkpoint_path=checkpoint_path,
+        checkpoint_freq=checkpoint_freq,
     )
 
 
 # ===========================================================================
-#                       DISTRIBUTED RANDOM SEARCH 
+#                       DISTRIBUTED RANDOM SEARCH
 # ===========================================================================
 async def run_random_search_distributed(
     asyncflow: WorkflowEngine,
     hpo: HPOLearner,
     n_samples: int,
     rng_seed: int = 0,
+    checkpoint_path: str | None = None,
+    checkpoint_freq: int = 10,
 ) -> Dict[str, Any]:
+    """
+    Distributed RANDOM search: sample n configs from the grid and evaluate them.
+    """
     param_grid = hpo.config.param_grid
     if not param_grid:
         raise ValueError("param_grid is empty – nothing to sample from.")
@@ -155,6 +215,8 @@ async def run_random_search_distributed(
         hpo=hpo,
         param_list=sampled,
         context_label="RANDOM",
+        checkpoint_path=checkpoint_path,
+        checkpoint_freq=checkpoint_freq,
     )
 
 
@@ -168,6 +230,8 @@ async def run_bayesian_search_distributed(
     n_iter: int = 15,
     kappa: float = 2.0,
     rng_seed: int = 0,
+    checkpoint_path: str | None = None,
+    checkpoint_freq: int = 10,
 ) -> Dict[str, Any]:
     """
     Distributed Bayesian Optimization.
@@ -199,7 +263,7 @@ async def run_bayesian_search_distributed(
     tried = list(idxs[:n_init])
     remaining = set(idxs[n_init:])
 
-    # ---- Initial evaluations (parallel)
+    # ---- Initial evaluations (parallel) ----
     init_params = [param_list_full[i] for i in tried]
     start = len(hpo.history)
 
@@ -208,6 +272,8 @@ async def run_bayesian_search_distributed(
         hpo,
         init_params,
         context_label="BAYESIAN_INIT",
+        checkpoint_path=checkpoint_path,
+        checkpoint_freq=checkpoint_freq,
     )
 
     batch = hpo.history[start:]
@@ -228,14 +294,14 @@ async def run_bayesian_search_distributed(
                 best_params = rec["params"]
                 best_score = rec["score"]
 
-    # ---- BO iterations
+    # ---- BO iterations ----
     for _ in range(n_iter):
         if not remaining:
             break
 
         gp = GaussianProcessRegressor(
             kernel=RBF() + WhiteKernel(1e-3),
-            normalize_y=True
+            normalize_y=True,
         )
         gp.fit(X_obs, y_obs)
 
@@ -243,7 +309,7 @@ async def run_bayesian_search_distributed(
         X_cand = vectors[cand_idx]
         mu, sigma = gp.predict(X_cand, return_std=True)
 
-        # UCB/LCB
+        # UCB/LCB acquisition
         if hpo.config.maximize:
             acq = -(mu + kappa * sigma)
         else:
@@ -260,6 +326,8 @@ async def run_bayesian_search_distributed(
             hpo,
             [p],
             context_label="BAYESIAN",
+            checkpoint_path=checkpoint_path,
+            checkpoint_freq=checkpoint_freq,
         )
         rec = hpo.history[start]
 
@@ -302,12 +370,15 @@ async def run_genetic_search_distributed(
     mutation_rate: float = 0.1,
     elitism: int = 1,
     rng_seed: int = 0,
+    checkpoint_path: str | None = None,
+    checkpoint_freq: int = 10,
 ) -> Dict[str, Any]:
     """
     Distributed evaluation version of HPOLearner.genetic_search().
     """
 
     import numpy as np
+
     rng = np.random.default_rng(rng_seed)
 
     keys = list(hpo.config.param_grid.keys())
@@ -346,7 +417,12 @@ async def run_genetic_search_distributed(
     start = len(hpo.history)
 
     await _evaluate_configs_distributed(
-        asyncflow, hpo, population, context_label="GA_INIT"
+        asyncflow,
+        hpo,
+        population,
+        context_label="GA_INIT",
+        checkpoint_path=checkpoint_path,
+        checkpoint_freq=checkpoint_freq,
     )
 
     batch = hpo.history[start:]
@@ -357,7 +433,7 @@ async def run_genetic_search_distributed(
         new_pop = []
 
         # elitism
-        if elitism > 0:
+        if elitism > 0 and len(fitness) > 0:
             if hpo.config.maximize:
                 elite = np.argsort(-fitness)[:elitism]
             else:
@@ -366,7 +442,7 @@ async def run_genetic_search_distributed(
                 new_pop.append(population[idx].copy())
 
         # offspring creation
-        while len(new_pop) < population_size:
+        while len(new_pop) < population_size and len(fitness) > 0:
             # tournament selection
             idxs = rng.integers(0, len(population), size=tournament_size)
             if hpo.config.maximize:
@@ -388,13 +464,21 @@ async def run_genetic_search_distributed(
         # distributed eval of next generation
         start = len(hpo.history)
         await _evaluate_configs_distributed(
-            asyncflow, hpo, population, context_label="GA"
+            asyncflow,
+            hpo,
+            population,
+            context_label="GA",
+            checkpoint_path=checkpoint_path,
+            checkpoint_freq=checkpoint_freq,
         )
 
         batch = hpo.history[start:]
         fitness = np.array([rec["score"] for rec in batch])
 
     # pick best
+    if len(fitness) == 0:
+        raise ValueError("[GA] No valid individuals evaluated – all scores are None.")
+
     if hpo.config.maximize:
         idx = int(np.argmax(fitness))
     else:

@@ -64,12 +64,26 @@ def parse_args():
     parser.add_argument("--batch_size",    nargs="+", type=positive_int,   required=True)
     parser.add_argument("--l2_reg",        nargs="+", type=float,          required=True)
 
-    # Optionally, allow user to tweak epochs (default 5)
+    # allow user to tweak epochs (default 5)
     parser.add_argument(
         "--epochs",
         type=positive_int,
         default=5,
         help="Number of training epochs per configuration (default: 5).",
+    )
+
+    # checkpoint arguments
+    parser.add_argument(
+        "--checkpoint_path",
+        type=str,
+        default=None,
+        help="If set, save HPO history as JSON to this path periodically.",
+    )
+    parser.add_argument(
+        "--checkpoint_freq",
+        type=positive_int,
+        default=10,
+        help="Save checkpoint every N successful evaluations (only if checkpoint_path is set).",
     )
 
     return parser.parse_args()
@@ -101,7 +115,7 @@ def mnist_objective(params: dict) -> float:
     batch_size    = int(params["batch_size"])
     l2_reg        = float(params["l2_reg"])
 
-    # We also allow passing "epochs" in params (optional)
+    # allow passing "epochs" in params
     epochs = int(params.get("epochs", 5))
 
     # ---- Load and preprocess MNIST ----
@@ -164,7 +178,6 @@ async def main(args):
     asyncflow = await WorkflowEngine.create(backend)
 
     # 2) Build search space from CLI arguments
-    #    (same hyperparameter names/structure as in local examples)
     search_space = {
         "learning_rate": args.learning_rate,
         "num_layers":    args.num_layers,
@@ -174,9 +187,6 @@ async def main(args):
     }
 
     # Inject epochs as a "constant" hyperparameter if user specified it.
-    # This way it is available inside `mnist_objective` via params["epochs"]
-    # even though we don't search over it.
-    # (We can also extend this later to search over epochs.)
     if args.epochs:
         search_space["epochs"] = [args.epochs]
 
@@ -189,7 +199,12 @@ async def main(args):
     hpo = HPOLearner(objective_fn=mnist_objective, config=config)
 
     # 4) Run **distributed** grid search via ROSE runtime
-    result = await run_grid_search_distributed(asyncflow, hpo)
+    result = await run_grid_search_distributed(
+        asyncflow,
+        hpo,
+        checkpoint_path=args.checkpoint_path,
+        checkpoint_freq=args.checkpoint_freq,
+    )
 
     best_params = result["best_params"]
     best_score = result["best_score"]
@@ -200,7 +215,6 @@ async def main(args):
     print(f"Best score (Val Accuracy): {best_score:.4f}")
     print(f"Total configs tried: {len(history)}")
 
-    # Optional: print a compact view of the result object
     print("\n=== Result object returned to main() ===")
     print(result)
 
