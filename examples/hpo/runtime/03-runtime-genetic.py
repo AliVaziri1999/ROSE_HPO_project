@@ -1,21 +1,16 @@
 import argparse
-import asyncio
-from concurrent.futures import ProcessPoolExecutor
-from typing import Dict, Any, List
+from typing import Dict, Any
 
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers, models
-
-from radical.asyncflow import WorkflowEngine, ConcurrentExecutionBackend
-from radical.asyncflow.logging import init_default_logger
 
 from rose.hpo import HPOLearner, HPOLearnerConfig
 from rose.hpo.runtime_genetic import run_genetic_hpo_task
 
 
 # ----------------------------------------------------------
-# 1) MNIST utilities
+#                       MNIST utilities
 # ----------------------------------------------------------
 
 def load_mnist(normalize: bool = True):
@@ -37,7 +32,7 @@ def load_mnist(normalize: bool = True):
 
 
 # ----------------------------------------------------------
-# 2) MLP model builder (same as other runtime scripts)
+#                       MLP model builder
 # ----------------------------------------------------------
 
 def build_mlp(input_dim, num_layers, hidden_units, learning_rate, l2_reg):
@@ -63,7 +58,7 @@ def build_mlp(input_dim, num_layers, hidden_units, learning_rate, l2_reg):
 
 
 # ----------------------------------------------------------
-# 3) Objective wrapper for HPOLearner
+#               Objective wrapper for HPOLearner
 # ----------------------------------------------------------
 
 def make_objective(x_train, y_train, x_val, y_val, epochs):
@@ -98,14 +93,15 @@ def make_objective(x_train, y_train, x_val, y_val, epochs):
 
 
 # ----------------------------------------------------------
-# 4) CLI parser
+#                           CLI parser
 # ----------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Distributed GA search for MNIST via ROSE runtime."
+        description="Genetic Algorithm HPO for MNIST (local or ROSE-distributed)."
     )
 
+    # HPO search space
     p.add_argument("--learning_rate", type=float, nargs="+",
                    default=[0.0005, 0.001, 0.002])
     p.add_argument("--num_layers", type=int, nargs="+",
@@ -117,75 +113,74 @@ def parse_args():
     p.add_argument("--l2_reg", type=float, nargs="+",
                    default=[0.0, 0.0001])
 
-    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--epochs", type=int, default=3,
+                   help="Training epochs per evaluation.")
 
+    # GA hyperparameters
     p.add_argument("--population_size", type=int, default=20)
     p.add_argument("--n_generations", type=int, default=15)
+    p.add_argument("--tournament_size", type=int, default=3)
+    p.add_argument("--crossover_rate", type=float, default=0.9)
     p.add_argument("--mutation_rate", type=float, default=0.2)
+    p.add_argument("--elitism", type=int, default=1)
 
     p.add_argument("--rng_seed", type=int, default=0)
+
+    p.add_argument(
+        "--distributed",
+        action="store_true",
+        help="If set, run GA using ROSE / AsyncFlow distributed evaluation.",
+    )
 
     return p.parse_args()
 
 
 # ----------------------------------------------------------
-# 5) Main (async) – single GA job inside a ROSE task
+#               Main – local or distributed GA
 # ----------------------------------------------------------
 
-async def main():
+def main():
     args = parse_args()
 
-    init_default_logger()
-    backend = await ConcurrentExecutionBackend(ProcessPoolExecutor())
-    asyncflow = await WorkflowEngine.create(backend)
+    (x_train, y_train), (x_val, y_val) = load_mnist()
 
-    try:
-        (x_train, y_train), (x_val, y_val) = load_mnist()
+    objective = make_objective(
+        x_train=x_train,
+        y_train=y_train,
+        x_val=x_val,
+        y_val=y_val,
+        epochs=args.epochs,
+    )
 
-        objective = make_objective(
-            x_train=x_train,
-            y_train=y_train,
-            x_val=x_val,
-            y_val=y_val,
-            epochs=args.epochs,
-        )
+    space = {
+        "learning_rate": args.learning_rate,
+        "num_layers": args.num_layers,
+        "hidden_units": args.hidden_units,
+        "batch_size": args.batch_size,
+        "l2_reg": args.l2_reg,
+    }
 
-        space = {
-            "learning_rate": args.learning_rate,
-            "num_layers": args.num_layers,
-            "hidden_units": args.hidden_units,
-            "batch_size": args.batch_size,
-            "l2_reg": args.l2_reg,
-        }
+    config = HPOLearnerConfig(param_grid=space, maximize=True)
+    hpo = HPOLearner(objective_fn=objective, config=config)
 
-        config = HPOLearnerConfig(param_grid=space, maximize=True)
-        hpo = HPOLearner(objective_fn=objective, config=config)
+    result = run_genetic_hpo_task(
+        hpo=hpo,
+        population_size=args.population_size,
+        n_generations=args.n_generations,
+        tournament_size=args.tournament_size,
+        crossover_rate=args.crossover_rate,
+        mutation_rate=args.mutation_rate,
+        elitism=args.elitism,
+        rng_seed=args.rng_seed,
+        distributed=args.distributed,
+    )
 
-        async def _ga_runner():
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                None,
-                lambda: run_genetic_hpo_task(
-                    hpo=hpo,
-                    population_size=args.population_size,
-                    n_generations=args.n_generations,
-                    mutation_rate=args.mutation_rate,
-                    rng_seed=args.rng_seed,
-                )
-            )
-            return result
-
-        future = asyncflow.function_task(_ga_runner)()
-        result = await future
-
-        print("\n=== GA HPO via ROSE runtime ===")
-        print(f"Best params: {result['best_params']}")
-        print(f"Best score: {result['best_score']:.4f}")
-        print(f"Total evaluations: {len(result['history'])}")
-
-    finally:
-        await asyncflow.shutdown()
+    print("\n=== GA HPO RESULT ===")
+    print(f"Best params: {result['best_params']}")
+    print(f"Best score: {result['best_score']:.4f}")
+    print(f"Total evaluations: {len(result['history'])}")
+    print("======================\n")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

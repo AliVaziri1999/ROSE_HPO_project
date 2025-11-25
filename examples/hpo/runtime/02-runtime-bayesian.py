@@ -1,32 +1,27 @@
 """
 02-runtime-bayesian.py
 
-Bayesian Optimization over MNIST hyperparameters using ROSE runtime.
+Bayesian Optimization over MNIST hyperparameters.
 
-This script is the runtime-level counterpart of a local Bayesian example:
-- It still uses HPOLearner + HPOLearnerConfig.
-- It runs Bayesian Optimization (n_init + n_iter steps).
-- BUT the entire HPO run is executed as a single ROSE task
-  in a worker process via radical.asyncflow + ProcessPoolExecutor.
+This script:
+  - builds a MNIST MLP (no dropout, 1–2 hidden layers)
+  - defines an objective = validation accuracy
+  - creates an HPOLearner + HPOLearnerConfig
+  - runs Bayesian Optimization via run_bayesian_hpo_task()
 
-Later, you can extend this to "step-wise" BO where each evaluation
-is its own ROSE task. For now, this demonstrates how to offload
-a full BO run to the ROSE runtime.
+If --distributed is given, the BO evaluations are executed using the
+ROSE / AsyncFlow runtime (see rose.hpo.runtime_bayesian).
+Otherwise, the optimization is performed locally.
 """
 
 import argparse
-import asyncio
-from concurrent.futures import ProcessPoolExecutor
 from typing import Dict, Any
 
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers, models
 
-from radical.asyncflow import WorkflowEngine, ConcurrentExecutionBackend
-from radical.asyncflow.logging import init_default_logger
-
-from rose.hpo import HPOLearner, HPOLearnerConfig
+from rose.hpo import HPOLearner, HPOLearnerConfig, run_bayesian_hpo_task
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +154,7 @@ def parse_args() -> argparse.Namespace:
     """
     Example:
 
-      python3 02-runtime-bayesian.py \
+      python -m examples.hpo.runtime.02-runtime-bayesian \
         --learning_rate 0.0005 0.001 0.002 \
         --num_layers 1 2 \
         --hidden_units 64 128 \
@@ -169,10 +164,11 @@ def parse_args() -> argparse.Namespace:
         --n_init 4 \
         --n_iter 8 \
         --kappa 2.0 \
-        --rng_seed 0
+        --rng_seed 0 \
+        --distributed
     """
     parser = argparse.ArgumentParser(
-        description="Bayesian optimization over MNIST hyperparameters using ROSE runtime."
+        description="Bayesian optimization over MNIST hyperparameters."
     )
 
     parser.add_argument("--learning_rate", type=float, nargs="+",
@@ -198,98 +194,69 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rng_seed", type=int, default=0,
                         help="Random seed for BO / HPOLearner.")
 
+    parser.add_argument(
+        "--distributed",
+        action="store_true",
+        help="If set, run Bayesian optimization using ROSE / AsyncFlow.",
+    )
+
     return parser.parse_args()
 
 
 # ---------------------------------------------------------------------------
-# 5) MAIN – offload full BO run as ONE ROSE TASK
+# 5) MAIN – local or distributed BO
 # ---------------------------------------------------------------------------
 
-async def main():
+def main():
     args = parse_args()
-    init_default_logger()
 
-    # 5.1 Initialize ROSE runtime (AsyncFlow + ProcessPool)
-    backend = await ConcurrentExecutionBackend(ProcessPoolExecutor())
-    asyncflow = await WorkflowEngine.create(backend)
+    # 5.1 Load data
+    (x_train, y_train), (x_val, y_val) = load_mnist()
 
-    try:
-        # 5.2 Load data
-        (x_train, y_train), (x_val, y_val) = load_mnist()
+    # 5.2 Objective
+    objective = make_objective(
+        x_train=x_train,
+        y_train=y_train,
+        x_val=x_val,
+        y_val=y_val,
+        epochs=args.epochs,
+    )
 
-        # 5.3 Objective
-        objective = make_objective(
-            x_train=x_train,
-            y_train=y_train,
-            x_val=x_val,
-            y_val=y_val,
-            epochs=args.epochs,
-        )
+    # 5.3 Search space
+    param_grid = {
+        "learning_rate": args.learning_rate,
+        "num_layers": args.num_layers,
+        "hidden_units": args.hidden_units,
+        "batch_size": args.batch_size,
+        "l2_reg": args.l2_reg,
+    }
 
-        # 5.4 Search space
-        param_grid = {
-            "learning_rate": args.learning_rate,
-            "num_layers": args.num_layers,
-            "hidden_units": args.hidden_units,
-            "batch_size": args.batch_size,
-            "l2_reg": args.l2_reg,
-        }
+    config = HPOLearnerConfig(
+        param_grid=param_grid,
+        maximize=True,  # maximize validation accuracy
+    )
 
-        config = HPOLearnerConfig(
-            param_grid=param_grid,
-            maximize=True,  # maximize validation accuracy
-        )
+    hpo = HPOLearner(
+        objective_fn=objective,
+        config=config,
+    )
 
-        hpo = HPOLearner(
-            objective_fn=objective,
-            config=config,
-        )
+    # 5.4 Run Bayesian optimization (local or distributed)
+    result = run_bayesian_hpo_task(
+        hpo=hpo,
+        n_init=args.n_init,
+        n_iter=args.n_iter,
+        kappa=args.kappa,
+        rng_seed=args.rng_seed,
+        distributed=args.distributed,
+    )
 
-        # 5.5 Define a synchronous BO run
-        def _do_bayes():
-            """
-            Runs Bayesian optimization **inside a worker process**.
-
-            HPOLearner.bayesian_search handles:
-              - n_init random picks
-              - n_iter BO iterations
-              - tracking history, best params, best score.
-            """
-            best_params, best_score, history = hpo.bayesian_search(
-                n_init=args.n_init,
-                n_iter=args.n_iter,
-                kappa=args.kappa,
-                rng_seed=args.rng_seed,
-            )
-
-            print("\n===== BAYESIAN OPTIMIZATION (via ROSE runtime) =====")
-            print(f"Total evaluations: {len(history)}")
-            print(f"Best params: {best_params}")
-            print(f"Best Val Accuracy: {best_score:.4f}")
-            print("====================================================\n")
-
-            return {
-                "best_params": best_params,
-                "best_score": best_score,
-                "history": history,
-            }
-
-        # 5.6 Async wrapper to call _do_bayes via executor
-        async def run_hpo_once():
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, _do_bayes)
-
-        # 5.7 Submit one BO job as a ROSE task
-        hpo_future = asyncflow.function_task(run_hpo_once)()
-        result = await hpo_future
-
-        print("=== Result object returned to main() ===")
-        print(result)
-
-    finally:
-        # 5.8 Clean shutdown
-        await asyncflow.shutdown()
+    print("\n===== BAYESIAN OPTIMIZATION RESULT =====")
+    print(f"Total evaluations: {len(result['history'])}")
+    print(f"Best params: {result['best_params']}")
+    print(f"Best Val Accuracy: {result['best_score']:.4f}")
+    print("========================================\n")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

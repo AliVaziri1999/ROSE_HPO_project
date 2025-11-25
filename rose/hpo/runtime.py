@@ -2,109 +2,103 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any, Dict, List
-
-import numpy as np 
+import numpy as np
 
 from radical.asyncflow import WorkflowEngine
 
 from .hpo_learner import HPOLearner
 
 
-# ---------------------------------------------------------------------------
-# Internal helper: run a LIST of hyperparameter configs as ROSE tasks
-# ---------------------------------------------------------------------------
-
+# ===========================================================================
+# INTERNAL HELPER — distributed evaluation of multiple configs
+# Added:
+#   - return_exceptions=True for fault tolerance
+#   - optional checkpointing argument
+# ===========================================================================
 async def _evaluate_configs_distributed(
     asyncflow: WorkflowEngine,
     hpo: HPOLearner,
     param_list: List[Dict[str, Any]],
     context_label: str = "HPO",
+    checkpoint_path: str | None = None,
 ) -> Dict[str, Any]:
     """
-    Submit a list of hyperparameter configurations to ROSE / asyncflow,
-    wait for all of them to finish, and return the best one.
+    Evaluate each params dict as a separate ROSE task using asyncflow.
 
-    This helper is shared by grid search, random search, and can also be
-    reused by Bayesian / GA runtimes.
-
-    Parameters
-    ----------
-    asyncflow :
-        An initialized WorkflowEngine instance (usually with ConcurrentExecutionBackend).
-    hpo :
-        HPOLearner instance. Must provide:
-          - objective_fn(params) -> float
-          - config.maximize: bool (True = higher score is better)
-          - history: list to be extended with all evaluated trials
-    param_list :
-        List of hyperparameter configurations (each a dict) to evaluate.
-    context_label :
-        Small string used in log messages, just to identify which strategy
-        is calling this helper (e.g., "GRID", "RANDOM", "BAYESIAN", "GA").
-
-    Returns
-    -------
-    dict with keys:
-        - "best_params": dict
-        - "best_score": float
-        - "history": list of {"params": ..., "score": ...}
+    Improvements included:
+      - fault-tolerant gather() (per-task exception handling)
+      - optional checkpointing
+      - shared by Grid, Random, Bayesian, GA distributed versions.
     """
+
     if not param_list:
         raise ValueError(
             f"{context_label} received an empty param_list – nothing to evaluate."
         )
 
-    print(f"[{context_label}] Submitting {len(param_list)} configurations to ROSE...")
+    print(f"[{context_label}] Submitting {len(param_list)} configs to ROSE...")
 
     local_history: List[Dict[str, Any]] = []
 
-    # This function is what each worker process actually runs.
+    # Worker function
     async def eval_one(params: Dict[str, Any]) -> Dict[str, Any]:
-        # Note: objective_fn is usually a *blocking* function that trains
-        # a model and returns a scalar score. Parallelism comes from the
-        # underlying ProcessPool in asyncflow, not from async logic inside
-        # this function.
-        score = hpo.objective_fn(params)
-        # Cast to plain float to keep JSON / logging clean.
-        return {"params": params, "score": float(score)}
+        try:
+            score = hpo.objective_fn(params)
+            return {"params": params, "score": float(score)}
+        except Exception as e:
+            return {"params": params, "error": str(e), "score": None}
 
-    # Wrap eval_one into an asyncflow "function task" so each call becomes
-    # a distributed / parallel task.
     eval_task = asyncflow.function_task(eval_one)
-
-    # One task per configuration
     futures = [eval_task(p) for p in param_list]
 
-    # Wait for all tasks to finish
-    results: List[Dict[str, Any]] = await asyncio.gather(*futures)
+    # Fault-tolerant gather
+    results = await asyncio.gather(*futures, return_exceptions=True)
 
-    # Find the best configuration according to the "maximize" flag
-    best_params: Dict[str, Any] | None = None
+    # Evaluate results
+    best_params = None
     best_score: float | None = None
 
-    for rec in results:
-        local_history.append(rec)
-        score = rec["score"]
+    for params, rec in zip(param_list, results):
 
+        # If the task itself crashed inside AsyncFlow
+        if isinstance(rec, Exception):
+            print(f"[{context_label}] ERROR (AsyncFlow-level) for {params}: {rec}")
+            hpo.history.append({"params": params, "score": None, "error": str(rec)})
+            continue
+
+        # If our eval returned an error (inside objective_fn)
+        if "error" in rec:
+            print(f"[{context_label}] ERROR (objective_fn) for {params}: {rec['error']}")
+            hpo.history.append(rec)
+            continue
+
+        # Normal success path
+        score = rec["score"]
+        hpo.history.append(rec)
+        local_history.append(rec)
+
+        # Track best
         if best_score is None:
             best_score = score
             best_params = rec["params"]
-            continue
-
-        if hpo.config.maximize:
-            if score > best_score:
-                best_score = score
-                best_params = rec["params"]
         else:
-            if score < best_score:
+            if hpo.config.maximize and score > best_score:
+                best_score = score
+                best_params = rec["params"]
+            elif not hpo.config.maximize and score < best_score:
                 best_score = score
                 best_params = rec["params"]
 
-    # Extend the learner's history so we keep a global record of all trials
-    hpo.history.extend(local_history)
+        # Optional checkpointing
+        if checkpoint_path is not None and len(hpo.history) % 10 == 0:
+            import json, pathlib
+            pathlib.Path(checkpoint_path).write_text(
+                json.dumps(hpo.history, indent=2)
+            )
+            print(f"[{context_label}] Checkpoint saved → {checkpoint_path}")
 
     if best_params is None or best_score is None:
-        raise ValueError(f"[{context_label}] No valid results – unexpected.")
+        raise ValueError(f"[{context_label}] No valid results – all configs failed.")
 
     print(
         f"[{context_label}] Best score: {best_score:.4f} "
@@ -118,38 +112,14 @@ async def _evaluate_configs_distributed(
     }
 
 
-# ---------------------------------------------------------------------------
-# GRID SEARCH – one task per configuration
-# ---------------------------------------------------------------------------
-
+# ===========================================================================
+#                       DISTRIBUTED GRID SEARCH
+# ===========================================================================
 async def run_grid_search_distributed(
     asyncflow: WorkflowEngine,
     hpo: HPOLearner,
 ) -> Dict[str, Any]:
-    """
-    Run a grid search where **each hyperparameter configuration**
-    is evaluated as its own ROSE / asyncflow task.
-
-    Parameters
-    ----------
-    asyncflow :
-        An initialized WorkflowEngine instance (using ConcurrentExecutionBackend).
-    hpo :
-        HPOLearner configured with:
-          - objective_fn: params -> score (float)
-          - config.param_grid: dict of hyperparameter lists
-
-    Returns
-    -------
-    dict with keys:
-        - "best_params": dict
-        - "best_score": float
-        - "history": list of {"params": ..., "score": ...}
-    """
-    # Collect all parameter combinations from the learner's grid
-    param_list: List[Dict[str, Any]] = list(hpo._iter_param_combinations())
-
-    # Delegate to the shared distributed evaluator
+    param_list = list(hpo._iter_param_combinations())
     return await _evaluate_configs_distributed(
         asyncflow=asyncflow,
         hpo=hpo,
@@ -158,64 +128,285 @@ async def run_grid_search_distributed(
     )
 
 
-# ---------------------------------------------------------------------------
-# RANDOM SEARCH – sample n configurations from the grid, then distribute
-# ---------------------------------------------------------------------------
-
+# ===========================================================================
+#                       DISTRIBUTED RANDOM SEARCH 
+# ===========================================================================
 async def run_random_search_distributed(
     asyncflow: WorkflowEngine,
     hpo: HPOLearner,
     n_samples: int,
     rng_seed: int = 0,
 ) -> Dict[str, Any]:
-    """
-    Distributed RANDOM search using ROSE / asyncflow.
-
-    Instead of enumerating the full Cartesian grid, we:
-      - sample `n_samples` hyperparameter configurations *with replacement*
-        from `hpo.config.param_grid`
-      - evaluate each sampled configuration as its OWN asyncflow task.
-
-    Parameters
-    ----------
-    asyncflow :
-        An initialized WorkflowEngine instance.
-    hpo :
-        HPOLearner configured with an objective_fn and param_grid.
-    n_samples :
-        How many random configurations to evaluate.
-    rng_seed :
-        Seed for the random number generator (for reproducibility).
-
-    Returns
-    -------
-    dict with keys:
-        - "best_params": dict
-        - "best_score": float
-        - "history": list of {"params": ..., "score": ...}
-          (this includes previous hpo.history entries plus these trials)
-    """
     param_grid = hpo.config.param_grid
     if not param_grid:
-        raise ValueError("param_grid is empty - nothing to sample from.")
+        raise ValueError("param_grid is empty – nothing to sample from.")
 
     rng = np.random.default_rng(rng_seed)
     keys = list(param_grid.keys())
-    value_arrays = [np.array(param_grid[k]) for k in keys]
+    arrays = [np.array(param_grid[k]) for k in keys]
 
-    # Sample n_samples random configs (with replacement)
-    sampled_params: List[Dict[str, Any]] = []
-    for _ in range(n_samples):
-        cfg = {
-            k: value_arrays[i][rng.integers(0, len(value_arrays[i]))]
-            for i, k in enumerate(keys)
-        }
-        sampled_params.append(cfg)
+    sampled = [
+        {k: arrays[i][rng.integers(0, len(arrays[i]))] for i, k in enumerate(keys)}
+        for _ in range(n_samples)
+    ]
 
-    # Delegate to the shared evaluator
     return await _evaluate_configs_distributed(
         asyncflow=asyncflow,
         hpo=hpo,
-        param_list=sampled_params,
+        param_list=sampled,
         context_label="RANDOM",
     )
+
+
+# ===========================================================================
+#                       DISTRIBUTED BAYESIAN OPTIMIZATION
+# ===========================================================================
+async def run_bayesian_search_distributed(
+    asyncflow: WorkflowEngine,
+    hpo: HPOLearner,
+    n_init: int = 5,
+    n_iter: int = 15,
+    kappa: float = 2.0,
+    rng_seed: int = 0,
+) -> Dict[str, Any]:
+    """
+    Distributed Bayesian Optimization.
+    Mirrors HPOLearner.bayesian_search(), but each evaluation is done
+    through ROSE tasks.
+    """
+
+    import numpy as np
+    from sklearn.gaussian_process import GaussianProcessRegressor
+    from sklearn.gaussian_process.kernels import RBF, WhiteKernel
+
+    rng = np.random.default_rng(rng_seed)
+
+    # Convert param_grid → arrays
+    param_list_full = list(hpo._iter_param_combinations())
+    keys = list(hpo.config.param_grid.keys())
+    vectors = np.array([[float(p[k]) for k in keys] for p in param_list_full])
+
+    n_total = len(param_list_full)
+    if n_total == 0:
+        raise ValueError("param_grid is empty.")
+
+    if n_init > n_total:
+        n_init = n_total
+
+    idxs = np.arange(n_total)
+    rng.shuffle(idxs)
+
+    tried = list(idxs[:n_init])
+    remaining = set(idxs[n_init:])
+
+    # ---- Initial evaluations (parallel)
+    init_params = [param_list_full[i] for i in tried]
+    start = len(hpo.history)
+
+    await _evaluate_configs_distributed(
+        asyncflow,
+        hpo,
+        init_params,
+        context_label="BAYESIAN_INIT",
+    )
+
+    batch = hpo.history[start:]
+    X_obs = np.array([[float(rec["params"][k]) for k in keys] for rec in batch])
+    y_obs = np.array([rec["score"] for rec in batch])
+
+    best_params = None
+    best_score = None
+    for rec in batch:
+        if best_score is None:
+            best_score = rec["score"]
+            best_params = rec["params"]
+        else:
+            if hpo.config.maximize and rec["score"] > best_score:
+                best_params = rec["params"]
+                best_score = rec["score"]
+            elif not hpo.config.maximize and rec["score"] < best_score:
+                best_params = rec["params"]
+                best_score = rec["score"]
+
+    # ---- BO iterations
+    for _ in range(n_iter):
+        if not remaining:
+            break
+
+        gp = GaussianProcessRegressor(
+            kernel=RBF() + WhiteKernel(1e-3),
+            normalize_y=True
+        )
+        gp.fit(X_obs, y_obs)
+
+        cand_idx = np.array(sorted(list(remaining)))
+        X_cand = vectors[cand_idx]
+        mu, sigma = gp.predict(X_cand, return_std=True)
+
+        # UCB/LCB
+        if hpo.config.maximize:
+            acq = -(mu + kappa * sigma)
+        else:
+            acq = (mu - kappa * sigma)
+
+        next_idx = cand_idx[int(np.argmin(acq))]
+        remaining.remove(next_idx)
+
+        p = param_list_full[next_idx]
+
+        start = len(hpo.history)
+        await _evaluate_configs_distributed(
+            asyncflow,
+            hpo,
+            [p],
+            context_label="BAYESIAN",
+        )
+        rec = hpo.history[start]
+
+        x_vec = np.array([float(rec["params"][k]) for k in keys])
+        score = rec["score"]
+
+        # update sets
+        X_obs = np.vstack([X_obs, x_vec])
+        y_obs = np.append(y_obs, score)
+
+        # update best
+        if hpo.config.maximize:
+            if score > best_score:
+                best_score = score
+                best_params = rec["params"]
+        else:
+            if score < best_score:
+                best_score = score
+                best_params = rec["params"]
+
+    print(f"[BAYESIAN] Distributed BO → best score {best_score} params {best_params}")
+
+    return {
+        "best_params": best_params,
+        "best_score": best_score,
+        "history": hpo.history,
+    }
+
+
+# ===========================================================================
+#                       DISTRIBUTED GENETIC ALGORITHM
+# ===========================================================================
+async def run_genetic_search_distributed(
+    asyncflow: WorkflowEngine,
+    hpo: HPOLearner,
+    population_size: int = 20,
+    n_generations: int = 30,
+    tournament_size: int = 3,
+    crossover_rate: float = 0.9,
+    mutation_rate: float = 0.1,
+    elitism: int = 1,
+    rng_seed: int = 0,
+) -> Dict[str, Any]:
+    """
+    Distributed evaluation version of HPOLearner.genetic_search().
+    """
+
+    import numpy as np
+    rng = np.random.default_rng(rng_seed)
+
+    keys = list(hpo.config.param_grid.keys())
+    value_lists = [hpo.config.param_grid[k] for k in keys]
+
+    def random_individual():
+        return {
+            k: rng.choice(value_lists[i])
+            for i, k in enumerate(keys)
+        }
+
+    def crossover(p1, p2):
+        if rng.random() > crossover_rate:
+            return p1.copy(), p2.copy()
+        point = rng.integers(1, len(keys))
+        c1, c2 = {}, {}
+        for i, k in enumerate(keys):
+            if i < point:
+                c1[k] = p1[k]
+                c2[k] = p2[k]
+            else:
+                c1[k] = p2[k]
+                c2[k] = p1[k]
+        return c1, c2
+
+    def mutate(ind):
+        if rng.random() > mutation_rate:
+            return ind
+        i = rng.integers(0, len(keys))
+        k = keys[i]
+        ind[k] = rng.choice(value_lists[i])
+        return ind
+
+    # ----- initial population eval -----
+    population = [random_individual() for _ in range(population_size)]
+    start = len(hpo.history)
+
+    await _evaluate_configs_distributed(
+        asyncflow, hpo, population, context_label="GA_INIT"
+    )
+
+    batch = hpo.history[start:]
+    fitness = np.array([rec["score"] for rec in batch])
+
+    # ----- evolution loop -----
+    for _ in range(n_generations):
+        new_pop = []
+
+        # elitism
+        if elitism > 0:
+            if hpo.config.maximize:
+                elite = np.argsort(-fitness)[:elitism]
+            else:
+                elite = np.argsort(fitness)[:elitism]
+            for idx in elite:
+                new_pop.append(population[idx].copy())
+
+        # offspring creation
+        while len(new_pop) < population_size:
+            # tournament selection
+            idxs = rng.integers(0, len(population), size=tournament_size)
+            if hpo.config.maximize:
+                p1 = population[idxs[np.argmax(fitness[idxs])]]
+                p2 = population[idxs[np.argsort(fitness[idxs])[-2]]]
+            else:
+                p1 = population[idxs[np.argmin(fitness[idxs])]]
+                p2 = population[idxs[np.argsort(fitness[idxs])[1]]]
+
+            c1, c2 = crossover(p1, p2)
+            c1, c2 = mutate(c1), mutate(c2)
+
+            new_pop.append(c1)
+            if len(new_pop) < population_size:
+                new_pop.append(c2)
+
+        population = new_pop
+
+        # distributed eval of next generation
+        start = len(hpo.history)
+        await _evaluate_configs_distributed(
+            asyncflow, hpo, population, context_label="GA"
+        )
+
+        batch = hpo.history[start:]
+        fitness = np.array([rec["score"] for rec in batch])
+
+    # pick best
+    if hpo.config.maximize:
+        idx = int(np.argmax(fitness))
+    else:
+        idx = int(np.argmin(fitness))
+
+    best_params = population[idx]
+    best_score = float(fitness[idx])
+
+    print(f"[GA] Distributed GA → best {best_score} params {best_params}")
+
+    return {
+        "best_params": best_params,
+        "best_score": best_score,
+        "history": hpo.history,
+    }
