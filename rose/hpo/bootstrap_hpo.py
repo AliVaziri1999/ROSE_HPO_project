@@ -1,13 +1,42 @@
 """
-Single entrypoint (bootstrapper) for running all ROSE-based distributed
-HPO strategies on MNIST:
+bootstrap_hpo.py
 
-  --strategy {grid, random, bayesian, ga}
+Unified CLI to run HPO experiments (GRID / RANDOM / BAYESIAN / GA)
+on an MNIST MLP using the ROSE runtime.
 
-It reuses the same model and data pattern as the other runtime examples:
-  * MNIST MLP (1-2 dense layers, ReLU + softmax)
-  * HPOLearner + HPOLearnerConfig
-  * Distributed evaluation via rose.hpo.runtime.* functions
+Features:
+  - Shared MNIST loader and 1–2 layer MLP (no dropout).
+  - Unified hyperparameter space:
+      * learning_rate
+      * num_layers (1 or 2)
+      * hidden_units
+      * batch_size
+      * l2_reg
+      * epochs
+  - Strategy selection:
+      * GRID
+      * RANDOM
+      * BAYESIAN
+      * GA (Genetic Algorithm)
+  - Random Search knobs:
+      * random_n_samples
+      * random_rng_seed
+  - Bayesian Search knobs:
+      * bayes_n_init
+      * bayes_n_iter
+      * bayes_kappa
+      * bayes_rng_seed
+  - GA knobs:
+      * population_size
+      * n_generations
+      * tournament_size
+      * crossover_rate
+      * mutation_rate
+      * elitism
+      * ga_rng_seed
+  - Checkpointing:
+      * checkpoint_path
+      * checkpoint_freq
 """
 
 import argparse
@@ -22,31 +51,36 @@ from tensorflow.keras import layers, models
 from radical.asyncflow import WorkflowEngine, ConcurrentExecutionBackend
 from radical.asyncflow.logging import init_default_logger
 
-from rose.hpo import HPOLearner, HPOLearnerConfig
-from rose.hpo.runtime import (
+from .hpo_learner import HPOLearner, HPOLearnerConfig
+from .runtime import (
     run_grid_search_distributed,
     run_random_search_distributed,
     run_bayesian_search_distributed,
     run_genetic_search_distributed,
 )
 
+
 # ---------------------------------------------------------------------------
 # 1) Data utilities: load & preprocess MNIST
 # ---------------------------------------------------------------------------
 
-
 def load_mnist(normalize: bool = True):
     """
-    Load the MNIST dataset and split it into:
-      - 50k train
-      - 10k validation
+    Load the MNIST dataset and return (x_train, y_train), (x_val, y_val).
 
-    Returns
-    -------
-    (x_train, y_train), (x_val, y_val)
+    We split the original training set into:
+      - 50k samples for training
+      - 10k samples for validation
+
+    Shapes:
+      x_train: (50000, 784)  float32
+      y_train: (50000,)      int64
+      x_val  : (10000, 784)  float32
+      y_val  : (10000,)      int64
     """
     (x_train_full, y_train_full), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
 
+    # Flatten 28x28 images → 784-dim vectors
     x_train_full = x_train_full.reshape(-1, 784).astype("float32")
     x_test = x_test.reshape(-1, 784).astype("float32")
 
@@ -54,6 +88,7 @@ def load_mnist(normalize: bool = True):
         x_train_full /= 255.0
         x_test /= 255.0
 
+    # Take 50k for training, 10k for validation
     x_train = x_train_full[:50000]
     y_train = y_train_full[:50000]
     x_val = x_train_full[50000:]
@@ -66,14 +101,11 @@ def load_mnist(normalize: bool = True):
 # 2) Model builder: simple 1–2 layer MLP (no dropout)
 # ---------------------------------------------------------------------------
 
-
-def build_mlp(
-    input_dim: int,
-    num_layers: int,
-    hidden_units: int,
-    learning_rate: float,
-    l2_reg: float,
-) -> tf.keras.Model:
+def build_mlp(input_dim: int,
+              num_layers: int,
+              hidden_units: int,
+              learning_rate: float,
+              l2_reg: float) -> tf.keras.Model:
     """
     Build a simple fully-connected network for MNIST classification.
 
@@ -99,7 +131,7 @@ def build_mlp(
         )
     )
 
-    # second hidden layer
+    # Optional second hidden layer
     if num_layers == 2:
         model.add(
             layers.Dense(
@@ -113,6 +145,7 @@ def build_mlp(
     model.add(layers.Dense(10, activation="softmax"))
 
     opt = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+
     model.compile(
         optimizer=opt,
         loss="sparse_categorical_crossentropy",
@@ -123,17 +156,10 @@ def build_mlp(
 
 
 # ---------------------------------------------------------------------------
-# 3) Objective wrapper for HPOLearner: params -> val_accuracy (maximize)
+# 3) Objective wrapper for HPOLearner: params -> val_accuracy (to maximize)
 # ---------------------------------------------------------------------------
 
-
-def make_objective(
-    x_train: np.ndarray,
-    y_train: np.ndarray,
-    x_val: np.ndarray,
-    y_val: np.ndarray,
-    epochs: int,
-):
+def make_objective(x_train, y_train, x_val, y_val, epochs: int):
     """
     Create an objective(params) -> score function.
 
@@ -142,6 +168,7 @@ def make_objective(
     """
 
     def objective(params: Dict[str, Any]) -> float:
+        # Extract hyperparameters (cast out of numpy scalars if needed)
         learning_rate = float(params["learning_rate"])
         num_layers = int(params["num_layers"])
         hidden_units = int(params["hidden_units"])
@@ -168,193 +195,211 @@ def make_objective(
         val_acc = float(history.history["val_accuracy"][-1])
 
         print(
-            f"[BOOTSTRAP-{params.get('strategy', 'HPO').upper()}] "
+            f"[BOOTSTRAP-{params.get('_strategy', 'HPO')}] "
             f"Params {params} → Val Accuracy = {val_acc:.4f}"
         )
 
-        return val_acc
+        return val_acc  # maximize
 
     return objective
 
 
 # ---------------------------------------------------------------------------
-# 4) CLI parser: common + strategy-specific options
+# 4) CLI parser: every knob for all strategies
 # ---------------------------------------------------------------------------
 
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Bootstrapper for distributed HPO on MNIST using ROSE runtime.\n"
-            "Choose a strategy with --strategy and configure hyperparameters."
-        )
+    p = argparse.ArgumentParser(
+        description="Bootstrapper for HPO over MNIST MLP using ROSE runtime "
+                    "(GRID / RANDOM / BAYESIAN / GA)."
     )
 
-    # Which HPO strategy to run
-    parser.add_argument(
+    # ----- global: strategy + dataset / training -----
+    p.add_argument(
         "--strategy",
         type=str,
         choices=["grid", "random", "bayesian", "ga"],
-        required=True,
-        help="Which HPO strategy to use.",
+        default="grid",
+        help="Which HPO strategy to run.",
     )
 
-    # Common search-space hyperparameters
-    parser.add_argument(
+    p.add_argument(
+        "--epochs",
+        type=int,
+        default=3,
+        help="Number of training epochs per configuration.",
+    )
+
+    p.add_argument(
+        "--no_normalize",
+        action="store_true",
+        help="If set, do NOT normalize MNIST pixel values to [0,1].",
+    )
+
+    # ----- shared search space (applies to all strategies) -----
+    p.add_argument(
         "--learning_rate",
         type=float,
         nargs="+",
         default=[0.0005, 0.001],
         help="Candidate learning rates.",
     )
-    parser.add_argument(
+    p.add_argument(
         "--num_layers",
         type=int,
         nargs="+",
         default=[1, 2],
         help="Number of hidden layers (1 or 2).",
     )
-    parser.add_argument(
+    p.add_argument(
         "--hidden_units",
         type=int,
         nargs="+",
         default=[64, 128],
-        help="Number of units in each hidden layer.",
+        help="Number of units per hidden layer.",
     )
-    parser.add_argument(
+    p.add_argument(
         "--batch_size",
         type=int,
         nargs="+",
-        default=[64, 128],
+        default=[32, 64],
         help="Candidate batch sizes.",
     )
-    parser.add_argument(
+    p.add_argument(
         "--l2_reg",
         type=float,
         nargs="+",
-        default=[0.0, 0.001],
+        default=[0.0, 0.0001],
         help="Candidate L2 regularization strengths.",
     )
 
-    parser.add_argument(
-        "--epochs",
+    # ----- RANDOM search knobs -----
+    p.add_argument(
+        "--random_n_samples",
         type=int,
-        default=1,
-        help="Number of training epochs per evaluation.",
+        default=20,
+        help="RANDOM: how many random configs to evaluate.",
+    )
+    p.add_argument(
+        "--random_rng_seed",
+        type=int,
+        default=0,
+        help="RANDOM: RNG seed for sampling configurations.",
     )
 
-    # Checkpointing (applies to all strategies)
-    parser.add_argument(
+    # ----- BAYESIAN search knobs -----
+    p.add_argument(
+        "--bayes_n_init",
+        type=int,
+        default=5,
+        help="BAYESIAN: number of initial random evaluations.",
+    )
+    p.add_argument(
+        "--bayes_n_iter",
+        type=int,
+        default=15,
+        help="BAYESIAN: number of BO iterations after init phase.",
+    )
+    p.add_argument(
+        "--bayes_kappa",
+        type=float,
+        default=2.0,
+        help="BAYESIAN: exploration parameter for UCB/LCB acquisition.",
+    )
+    p.add_argument(
+        "--bayes_rng_seed",
+        type=int,
+        default=0,
+        help="BAYESIAN: RNG seed for BO.",
+    )
+
+    # ----- GA (Genetic Algorithm) knobs -----
+    p.add_argument(
+        "--ga_population_size",
+        type=int,
+        default=20,
+        help="GA: population size.",
+    )
+    p.add_argument(
+        "--ga_n_generations",
+        type=int,
+        default=15,
+        help="GA: number of generations.",
+    )
+    p.add_argument(
+        "--ga_tournament_size",
+        type=int,
+        default=3,
+        help="GA: tournament size for selection.",
+    )
+    p.add_argument(
+        "--ga_crossover_rate",
+        type=float,
+        default=0.9,
+        help="GA: crossover probability.",
+    )
+    p.add_argument(
+        "--ga_mutation_rate",
+        type=float,
+        default=0.2,
+        help="GA: mutation probability.",
+    )
+    p.add_argument(
+        "--ga_elitism",
+        type=int,
+        default=1,
+        help="GA: number of elite individuals carried over.",
+    )
+    p.add_argument(
+        "--ga_rng_seed",
+        type=int,
+        default=0,
+        help="GA: RNG seed.",
+    )
+
+    # ----- checkpointing (for all runtime strategies) -----
+    p.add_argument(
         "--checkpoint_path",
         type=str,
         default=None,
-        help=(
-            "If set, periodically save JSON history to this path "
-            "(e.g., checkpoints/random_bootstrap.json)."
-        ),
+        help="Optional path to a JSON file where HPO history will be "
+             "periodically saved. If not provided, checkpointing is disabled.",
     )
-    parser.add_argument(
+    p.add_argument(
         "--checkpoint_freq",
         type=int,
-        default=2,
-        help="Checkpoint every N successful evaluations (<=0 disables).",
-    )
-
-    # Random search parameters
-    parser.add_argument(
-        "--n_samples",
-        type=int,
         default=10,
-        help="[RANDOM] Number of random configurations to evaluate.",
+        help="Save a checkpoint every N successful evaluations. "
+             "If <= 0, checkpointing is disabled.",
     )
 
-    # Bayesian search parameters
-    parser.add_argument(
-        "--n_init",
-        type=int,
-        default=5,
-        help="[BAYESIAN] Number of initial random points.",
-    )
-    parser.add_argument(
-        "--n_iter",
-        type=int,
-        default=15,
-        help="[BAYESIAN] Number of BO iterations after the initial points.",
-    )
-    parser.add_argument(
-        "--kappa",
-        type=float,
-        default=2.0,
-        help="[BAYESIAN] Exploration/exploitation trade-off constant.",
-    )
-
-    # GA parameters
-    parser.add_argument(
-        "--population_size",
-        type=int,
-        default=20,
-        help="[GA] Population size.",
-    )
-    parser.add_argument(
-        "--n_generations",
-        type=int,
-        default=15,
-        help="[GA] Number of generations.",
-    )
-    parser.add_argument(
-        "--tournament_size",
-        type=int,
-        default=3,
-        help="[GA] Tournament size for selection.",
-    )
-    parser.add_argument(
-        "--crossover_rate",
-        type=float,
-        default=0.9,
-        help="[GA] Crossover probability.",
-    )
-    parser.add_argument(
-        "--mutation_rate",
-        type=float,
-        default=0.2,
-        help="[GA] Mutation probability.",
-    )
-    parser.add_argument(
-        "--elitism",
-        type=int,
-        default=1,
-        help="[GA] Number of elite individuals to preserve each generation.",
-    )
-
-    # Shared random seed
-    parser.add_argument(
-        "--rng_seed",
-        type=int,
-        default=0,
-        help="[RANDOM/BAYESIAN/GA] Random seed.",
-    )
-
-    return parser.parse_args()
+    return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
-# 5) Main: set up ROSE runtime and dispatch to selected strategy
+# 5) Main: set up ROSE runtime and run chosen strategy
 # ---------------------------------------------------------------------------
 
-
-async def main():
-    args = parse_args()
-
-    # Initialize ROSE logging + execution backend + workflow engine
+async def _run_with_runtime(args: argparse.Namespace) -> Dict[str, Any]:
+    """
+    Internal helper that:
+      - initializes AsyncFlow backend,
+      - runs the selected HPO strategy,
+      - shuts everything down cleanly,
+      - returns the result dict.
+    """
     init_default_logger()
+
     backend = await ConcurrentExecutionBackend(ProcessPoolExecutor())
     asyncflow = await WorkflowEngine.create(backend)
 
     try:
         # Load data
-        (x_train, y_train), (x_val, y_val) = load_mnist()
+        (x_train, y_train), (x_val, y_val) = load_mnist(
+            normalize=not args.no_normalize
+        )
 
-        # Build objective function (shared)
+        # Build objective
         objective = make_objective(
             x_train=x_train,
             y_train=y_train,
@@ -363,7 +408,7 @@ async def main():
             epochs=args.epochs,
         )
 
-        # Build discrete search space from CLI ranges
+        # Shared search space
         param_grid: Dict[str, List[Any]] = {
             "learning_rate": args.learning_rate,
             "num_layers": args.num_layers,
@@ -374,15 +419,13 @@ async def main():
 
         config = HPOLearnerConfig(
             param_grid=param_grid,
-            maximize=True,  # we maximize validation accuracy
+            maximize=True,
         )
         hpo = HPOLearner(objective_fn=objective, config=config)
 
-        # Dispatch based on strategy
-        strategy = args.strategy.lower()
-
-        if strategy == "grid":
-            print("\n[BOOTSTRAP] Running GRID search (distributed)...\n")
+        # Strategy dispatch
+        if args.strategy == "grid":
+            print("\n[BOOTSTRAP] Running GRID search (distributed via ROSE)...\n")
             result = await run_grid_search_distributed(
                 asyncflow=asyncflow,
                 hpo=hpo,
@@ -390,64 +433,73 @@ async def main():
                 checkpoint_freq=args.checkpoint_freq,
             )
 
-        elif strategy == "random":
-            print("\n[BOOTSTRAP] Running RANDOM search (distributed)...\n")
+        elif args.strategy == "random":
+            print("\n[BOOTSTRAP] Running RANDOM search (distributed via ROSE)...\n")
             result = await run_random_search_distributed(
                 asyncflow=asyncflow,
                 hpo=hpo,
-                n_samples=args.n_samples,
-                rng_seed=args.rng_seed,
+                n_samples=args.random_n_samples,
+                rng_seed=args.random_rng_seed,
                 checkpoint_path=args.checkpoint_path,
                 checkpoint_freq=args.checkpoint_freq,
             )
 
-        elif strategy == "bayesian":
-            print("\n[BOOTSTRAP] Running BAYESIAN optimization (distributed)...\n")
+        elif args.strategy == "bayesian":
+            print("\n[BOOTSTRAP] Running BAYESIAN search (distributed via ROSE)...\n")
             result = await run_bayesian_search_distributed(
                 asyncflow=asyncflow,
                 hpo=hpo,
-                n_init=args.n_init,
-                n_iter=args.n_iter,
-                kappa=args.kappa,
-                rng_seed=args.rng_seed,
+                n_init=args.bayes_n_init,
+                n_iter=args.bayes_n_iter,
+                kappa=args.bayes_kappa,
+                rng_seed=args.bayes_rng_seed,
                 checkpoint_path=args.checkpoint_path,
                 checkpoint_freq=args.checkpoint_freq,
             )
 
-        elif strategy == "ga":
-            print("\n[BOOTSTRAP] Running GENETIC ALGORITHM search (distributed)...\n")
+        elif args.strategy == "ga":
+            print("\n[BOOTSTRAP] Running GA search (distributed via ROSE)...\n")
             result = await run_genetic_search_distributed(
                 asyncflow=asyncflow,
                 hpo=hpo,
-                population_size=args.population_size,
-                n_generations=args.n_generations,
-                tournament_size=args.tournament_size,
-                crossover_rate=args.crossover_rate,
-                mutation_rate=args.mutation_rate,
-                elitism=args.elitism,
-                rng_seed=args.rng_seed,
+                population_size=args.ga_population_size,
+                n_generations=args.ga_n_generations,
+                tournament_size=args.ga_tournament_size,
+                crossover_rate=args.ga_crossover_rate,
+                mutation_rate=args.ga_mutation_rate,
+                elitism=args.ga_elitism,
+                rng_seed=args.ga_rng_seed,
                 checkpoint_path=args.checkpoint_path,
                 checkpoint_freq=args.checkpoint_freq,
             )
 
         else:
-            raise ValueError(f"Unknown strategy: {strategy}")
+            raise ValueError(f"Unknown strategy: {args.strategy}")
 
-        best_params = result["best_params"]
-        best_score = result["best_score"]
-        history = result["history"]
-
-        print("\n=== HPO via ROSE runtime (BOOTSTRAP) ===")
-        print(f"Strategy: {strategy}")
-        print(f"Tried {len(history)} configurations")
-        print(f"Best params: {best_params}")
-        print(f"Best score (Val Accuracy): {best_score:.4f}")
-        print("========================================\n")
+        return result
 
     finally:
-        # Clean shutdown of the workflow engine + backend
         await asyncflow.shutdown()
 
 
+def main():
+    args = parse_args()
+
+    result = asyncio.run(_run_with_runtime(args))
+
+    best_params = result["best_params"]
+    best_score = result["best_score"]
+    history = result["history"]
+
+    print("\n=== HPO via ROSE runtime (bootstrap) ===")
+    print(f"Strategy        : {args.strategy.upper()}")
+    print(f"Tried configs   : {len(history)}")
+    print(f"Best params     : {best_params}")
+    print(f"Best score      : {best_score:.4f}")
+    if args.checkpoint_path:
+        print(f"Checkpoint file : {args.checkpoint_path}")
+    print("========================================\n")
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
