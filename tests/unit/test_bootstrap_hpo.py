@@ -1,36 +1,54 @@
+from __future__ import annotations
+
+import sys
 import pytest
 
-import rose.hpo.bootstrap_hpo as bootstrap_hpo
+from rose.hpo import bootstrap_hpo
 
 
-def test_parse_args_valid():
-    # If you have a parse_args function
-    if not hasattr(bootstrap_hpo, "parse_args"):
-        pytest.skip("bootstrap_hpo.parse_args not implemented")
+def _run_parse(argv: list[str]):
+    """
+    Helper: set sys.argv so that bootstrap_hpo.parse_args()
+    reads our fake CLI arguments, then restore sys.argv.
+    """
+    old_argv = sys.argv
+    sys.argv = ["bootstrap_hpo.py"] + argv
+    try:
+        args = bootstrap_hpo.parse_args()
+    finally:
+        sys.argv = old_argv
+    return args
 
-    args = bootstrap_hpo.parse_args([
-        "--strategy", "grid",
-        "--learning_rate", "0.001",
-        "--num_layers", "2",
-        "--hidden_units", "64",
-        "--batch_size", "64",
-        "--l2_reg", "0.0",
-    ])
 
+def test_parse_args_defaults():
+    """
+    Check that parse_args() works with no extra CLI args and
+    returns a Namespace with expected basic attributes.
+    This matches your current CLI that uses defaults.
+    """
+    args = _run_parse([])
+
+    # Strategy should be one of allowed ones and default to "grid"
+    assert args.strategy in ["grid", "random", "bayesian", "ga"]
+    # We know default is "grid" in your code
     assert args.strategy == "grid"
-    assert args.learning_rate == pytest.approx(0.001)
-    assert args.num_layers == 2
-    assert args.hidden_units == 64
-    assert args.batch_size == 64
-    assert args.l2_reg == pytest.approx(0.0)
+
+    # Shared search space exists and is list-like
+    assert isinstance(args.learning_rate, list)
+    assert isinstance(args.num_layers, list)
+    assert isinstance(args.hidden_units, list)
+    assert isinstance(args.batch_size, list)
+    assert isinstance(args.l2_reg, list)
+
+    # Some global knobs exist
+    assert isinstance(args.epochs, int)
+    assert hasattr(args, "no_normalize")
 
 
 def test_parse_args_invalid_strategy():
-    if not hasattr(bootstrap_hpo, "parse_args"):
-        pytest.skip("bootstrap_hpo.parse_args not implemented")
-
+    """
+    If user passes an invalid strategy, argparse should raise SystemExit,
+    which is the standard behavior and also what we expect for the project.
+    """
     with pytest.raises(SystemExit):
-        # Assuming argparse exits on invalid choice
-        bootstrap_hpo.parse_args([
-            "--strategy", "invalid_strategy",
-        ])
+        _run_parse(["--strategy", "invalid_strategy"])

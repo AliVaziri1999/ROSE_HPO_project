@@ -1,6 +1,4 @@
 """
-bootstrap_hpo.py
-
 Unified CLI to run HPO experiments (GRID / RANDOM / BAYESIAN / GA)
 on an MNIST MLP using the ROSE runtime.
 
